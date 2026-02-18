@@ -1,0 +1,72 @@
+import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
+import Stripe from "https://esm.sh/stripe@18.5.0";
+import { createClient } from "npm:@supabase/supabase-js@2.57.2";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
+};
+
+const ALLOWED_ORIGINS = [
+  'https://pflege-link.lovable.app',
+  /^https:\/\/id-preview--[a-f0-9-]+\.lovable\.app$/,
+];
+
+function getValidOrigin(origin: string | null): string {
+  if (!origin) return 'https://pflege-link.lovable.app';
+  for (const allowed of ALLOWED_ORIGINS) {
+    if (typeof allowed === 'string' && origin === allowed) return origin;
+    if (allowed instanceof RegExp && allowed.test(origin)) return origin;
+  }
+  return 'https://pflege-link.lovable.app';
+}
+
+serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  try {
+    const stripeKey = Deno.env.get("STRIPE_SECRET_KEY");
+    if (!stripeKey) throw new Error("STRIPE_SECRET_KEY is not set");
+
+    const supabaseClient = createClient(
+      Deno.env.get("SUPABASE_URL") ?? "",
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
+      { auth: { persistSession: false } }
+    );
+
+    const authHeader = req.headers.get("Authorization");
+    if (!authHeader?.startsWith("Bearer ")) {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        status: 401,
+      });
+    }
+
+    const token = authHeader.replace("Bearer ", "");
+    const { data: userData, error: userError } = await supabaseClient.auth.getUser(token);
+    if (userError) throw new Error(`Auth error: ${userError.message}`);
+    const user = userData.user;
+    if (!user?.email) throw new Error("User not authenticated");
+
+    const stripe = new Stripe(stripeKey, { apiVersion: "2025-08-27.basil" });
+    const customers = await stripe.customers.list({ email: user.email, limit: 1 });
+    if (customers.data.length === 0) throw new Error("No Stripe customer found");
+
+    const validOrigin = getValidOrigin(req.headers.get("origin"));
+    const portalSession = await stripe.billingPortal.sessions.create({
+      customer: customers.data[0].id,
+      return_url: `${validOrigin}/pricing`,
+    });
+
+    return new Response(JSON.stringify({ url: portalSession.url }), {
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: "An error occurred" }), {
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+      status: 500,
+    });
+  }
+});
